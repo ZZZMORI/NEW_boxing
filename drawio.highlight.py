@@ -304,7 +304,8 @@ def build_symbols(cells: list[TextCell]) -> list[Symbol]:
                 continue
             vertical_gap = class_cell.y - code_cell.bottom
             center_gap = abs(class_cell.center_x - code_cell.center_x)
-            if -2 <= vertical_gap <= 18 and center_gap <= max(14, code_cell.width * 1.1):
+            # 매칭 허용 범위 확대: 세로 간격을 25까지, 가로 편차를 코드 너비의 1.5배까지 허용
+            if -4 <= vertical_gap <= 25 and center_gap <= max(20, code_cell.width * 1.5):
                 matches.append((abs(vertical_gap), center_gap, class_cell))
 
         if not matches:
@@ -320,28 +321,27 @@ def build_symbols(cells: list[TextCell]) -> list[Symbol]:
         code_box = box_from_cell(code_cell)
         class_box = box_from_cell(class_cell)
 
-        # 코드 + 클래스의 중심만 구하고, 박스 크기는 고정값 사용
         min_x = min(code_box[0], class_box[0])
         min_y = min(code_box[1], class_box[1])
         max_x = max(code_box[2], class_box[2])
         max_y = max(code_box[3], class_box[3])
 
-        cx = (min_x + max_x) / 2.0
+        # 사용자의 요청에 따라 AG(클래스 셀)의 수평 중심을 기준으로 박싱
+        cx = class_cell.center_x
+        # 수직 중심은 전체 영역(부호+기호)의 중간을 유지하여 양쪽을 모두 커버
         cy = (min_y + max_y) / 2.0
 
         # 고정 박스 크기
-        fixed_width = 23.0
-        fixed_height = 23.0
+        fixed_width = 24.0
+        fixed_height = 24.0
 
-        # 중심에서 왼쪽으로 1픽셀 이동
-        x = cx - fixed_width / 2.0 - 1.0
+        x = cx - fixed_width / 2.0
         y = cy - fixed_height / 2.0
         right = x + fixed_width
         bottom = y + fixed_height
 
         symbols.append(
             Symbol(
-
                 code=code_cell.value,
                 class_code=class_cell.value,
                 key=f"{prefix}|{class_cell.value}",
@@ -381,97 +381,8 @@ def overlaps(a: tuple[float, float, float, float], b: tuple[float, float, float,
     return ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1
 
 
-def shrink_pair(a: Symbol, b: Symbol) -> tuple[Symbol, Symbol]:
-    ax1, ay1, ax2, ay2 = a.x, a.y, a.right, a.bottom
-    bx1, by1, bx2, by2 = b.x, b.y, b.right, b.bottom
-
-    if not overlaps((ax1, ay1, ax2, ay2), (bx1, by1, bx2, by2)):
-        return a, b
-
-    # 가로로 더 많이 나란한 경우: 가운데에서 분할
-    horizontal_relation = abs(a.center_x - b.center_x) >= abs(a.center_y - b.center_y)
-
-    if horizontal_relation:
-        split_x = (a.center_x + b.center_x) / 2.0
-        if a.center_x <= b.center_x:
-            ax2 = min(ax2, split_x - 1)
-            bx1 = max(bx1, split_x + 1)
-        else:
-            bx2 = min(bx2, split_x - 1)
-            ax1 = max(ax1, split_x + 1)
-    else:
-        split_y = (a.center_y + b.center_y) / 2.0
-        if a.center_y <= b.center_y:
-            ay2 = min(ay2, split_y - 1)
-            by1 = max(by1, split_y + 1)
-        else:
-            by2 = min(by2, split_y - 1)
-            ay1 = max(ay1, split_y + 1)
-
-    # 코드/클래스 최소 외곽보다 작아지지 않게 보정
-    min_ax1 = min(a.code_box[0], a.class_box[0]) - 2.0
-    min_ay1 = min(a.code_box[1], a.class_box[1]) - 3.0
-    min_ax2 = max(a.code_box[2], a.class_box[2]) + 2.0
-    min_ay2 = max(a.code_box[3], a.class_box[3]) + 3.0
-
-    min_bx1 = min(b.code_box[0], b.class_box[0]) - 2.0
-    min_by1 = min(b.code_box[1], b.class_box[1]) - 3.0
-    min_bx2 = max(b.code_box[2], b.class_box[2]) + 2.0
-    min_by2 = max(b.code_box[3], b.class_box[3]) + 3.0
-
-    ax1 = min(ax1, min_ax1) if ax1 > min_ax1 else ax1
-    ay1 = min(ay1, min_ay1) if ay1 > min_ay1 else ay1
-    ax2 = max(ax2, min_ax2) if ax2 < min_ax2 else ax2
-    ay2 = max(ay2, min_ay2) if ay2 < min_ay2 else ay2
-
-    bx1 = min(bx1, min_bx1) if bx1 > min_bx1 else bx1
-    by1 = min(by1, min_by1) if by1 > min_by1 else by1
-    bx2 = max(bx2, min_bx2) if bx2 < min_bx2 else bx2
-    by2 = max(by2, min_by2) if by2 < min_by2 else by2
-
-    a2 = Symbol(
-        code=a.code,
-        class_code=a.class_code,
-        key=a.key,
-        code_box=a.code_box,
-        class_box=a.class_box,
-        x=ax1,
-        y=ay1,
-        width=max(1.0, ax2 - ax1),
-        height=max(1.0, ay2 - ay1),
-    )
-    b2 = Symbol(
-        code=b.code,
-        class_code=b.class_code,
-        key=b.key,
-        code_box=b.code_box,
-        class_box=b.class_box,
-        x=bx1,
-        y=by1,
-        width=max(1.0, bx2 - bx1),
-        height=max(1.0, by2 - by1),
-    )
-    return a2, b2
-
-
 def resolve_symbol_overlaps(symbols: list[Symbol]) -> list[Symbol]:
-    updated = symbols[:]
-    for _ in range(4):
-        changed = False
-        for i in range(len(updated)):
-            for j in range(i + 1, len(updated)):
-                a = updated[i]
-                b = updated[j]
-                before = (a.x, a.y, a.right, a.bottom, b.x, b.y, b.right, b.bottom)
-                a2, b2 = shrink_pair(a, b)
-                after = (a2.x, a2.y, a2.right, a2.bottom, b2.x, b2.y, b2.right, b2.bottom)
-                if before != after:
-                    updated[i] = a2
-                    updated[j] = b2
-                    changed = True
-        if not changed:
-            break
-    return updated
+    return symbols
 
 
 def find_layer_id(root: ET.Element, layer_name: str) -> str:
@@ -490,9 +401,8 @@ def find_existing_highlights(root: ET.Element, layer_id: str):
             continue
         if cell.attrib.get("parent") != layer_id:
             continue
-        if "#fff2cc" not in cell.attrib.get("style", ""):
-            continue
-        highlights.append((obj, cell, geom))
+        if "#fff2cc" in cell.attrib.get("style", ""):
+            highlights.append((obj, cell, geom))
     return highlights
 
 
@@ -550,6 +460,14 @@ def apply_highlights(tree: ET.ElementTree):
     highlights = find_existing_highlights(root, tmpl_layer_id)
     manual_highlights, auto_highlights = split_manual_and_auto_highlights(highlights)
 
+    # 기존 자동 생성된 박스들을 삭제하여 업데이트가 반영되도록 함
+    root_node = next(root.iter("root"))
+    for obj, _, _ in auto_highlights:
+        try:
+            root_node.remove(obj)
+        except ValueError:
+            pass
+
     if manual_highlights:
         style = manual_highlights[0][1].attrib.get("style", DEFAULT_STYLE)
     elif auto_highlights:
@@ -557,8 +475,9 @@ def apply_highlights(tree: ET.ElementTree):
     else:
         style = DEFAULT_STYLE
 
+    # 수동으로 그린 박스 위치만 체크
     existing_boxes = []
-    for _, _, geom in manual_highlights + auto_highlights:
+    for _, _, geom in manual_highlights:
         x = float(geom.attrib.get("x", 0))
         y = float(geom.attrib.get("y", 0))
         w = float(geom.attrib.get("width", 0))
@@ -566,9 +485,7 @@ def apply_highlights(tree: ET.ElementTree):
         existing_boxes.append((x, y, x + w, y + h))
 
     inserted = 0
-    root_node = next(root.iter("root"))
     groups = {}
-
     for symbol in symbols:
         groups.setdefault(symbol.key, symbol)
         box = (symbol.x, symbol.y, symbol.right, symbol.bottom)

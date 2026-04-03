@@ -1,5 +1,4 @@
 import html
-import itertools
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -7,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WINDOW_CODE_RE = re.compile(
-    r"(CM-B\d+[A-Za-z]?|CMB\d+[A-Za-z]?|[A-Z]{1,4}\d*(?:-[A-Z0-9]+)+[A-Za-z]?)"
+WINDOW_CODE_FULL_RE = re.compile(
+    r"^(CM-B\d+[A-Za-z]?|CMB\d+[A-Za-z]?|[A-Z]{1,4}\d*(?:[-.][A-Z0-9]+)+[A-Za-z]?)$"
 )
 CLASS_RE = re.compile(r"^[A-Z]{2,3}$")
 EXCLUDED_CLASSES = {
@@ -20,6 +19,12 @@ DEFAULT_STYLE = (
     "verticalAlign=middle;align=center;strokeColor=#d6b656;"
     "strokeWidth=1.1811;opacity=50;noLabel=1"
 )
+
+ROW_TOLERANCE = 2.5
+CODE_PART_GAP = 4.5
+MAX_CODE_PARTS = 4
+FIXED_WIDTH = 24.0
+FIXED_HEIGHT = 24.0
 
 
 @dataclass
@@ -110,7 +115,7 @@ def parse_text_cells(root: ET.Element, text_parent: str) -> list[TextCell]:
     return cells
 
 
-def cluster_rows(cells: list[TextCell], tolerance: float = 2.5) -> list[list[TextCell]]:
+def cluster_rows(cells: list[TextCell], tolerance: float = ROW_TOLERANCE) -> list[list[TextCell]]:
     rows = []
     for cell in sorted(cells, key=lambda item: (item.y, item.x)):
         for row in rows:
@@ -125,33 +130,14 @@ def cluster_rows(cells: list[TextCell], tolerance: float = 2.5) -> list[list[Tex
     return rows
 
 
-def merge_row_segments(row: list[TextCell], max_gap: float = 8.0) -> list[TextCell]:
-    merged = []
-    current = []
-    for cell in row:
-        if not current:
-            current = [cell]
-            continue
-        gap = cell.x - current[-1].right
-        if gap <= max_gap:
-            current.append(cell)
-            continue
-        merged.append(_merge_cells(current))
-        current = [cell]
-    if current:
-        merged.append(_merge_cells(current))
-    return merged
-
-
-def _merge_cells(cells: list[TextCell]) -> TextCell:
-    value = "".join(cell.value for cell in cells)
+def merge_cells(cells: list[TextCell], value: str | None = None) -> TextCell:
     x = min(cell.x for cell in cells)
     y = min(cell.y for cell in cells)
     right = max(cell.right for cell in cells)
     bottom = max(cell.bottom for cell in cells)
     return TextCell(
         cell_id=",".join(cell.cell_id for cell in cells),
-        value=value,
+        value=value if value is not None else "".join(cell.value for cell in cells),
         x=x,
         y=y,
         width=right - x,
@@ -164,115 +150,50 @@ def extract_prefix(code: str) -> str | None:
         return "CM-B"
     if code.startswith("CMB"):
         return "CMB"
-    if "-" not in code:
-        return None
-    return code.split("-", 1)[0]
+    if "-" in code:
+        return code.split("-", 1)[0]
+    if "." in code:
+        return code.split(".", 1)[0]
+    return None
 
 
-def estimate_code_box(merged_cell: TextCell, raw_cells: list[TextCell], code: str) -> TextCell:
-    if merged_cell.value == code:
-        return TextCell(
-            cell_id=merged_cell.cell_id,
-            value=code,
-            x=merged_cell.x,
-            y=merged_cell.y,
-            width=merged_cell.width,
-            height=merged_cell.height,
-        )
-
-    parts = []
-    for raw in raw_cells:
-        if abs(raw.y - merged_cell.y) > 2.5:
-            continue
-        if raw.x < merged_cell.x - 1 or raw.right > merged_cell.right + 1:
-            continue
-        if raw.value and raw.value in code:
-            parts.append(raw)
-
-    if not parts:
-        return TextCell(
-            cell_id=merged_cell.cell_id,
-            value=code,
-            x=merged_cell.x,
-            y=merged_cell.y,
-            width=merged_cell.width,
-            height=merged_cell.height,
-        )
-
-    x = min(p.x for p in parts)
-    y = min(p.y for p in parts)
-    right = max(p.right for p in parts)
-    bottom = max(p.bottom for p in parts)
-    return TextCell(
-        cell_id=",".join(p.cell_id for p in parts),
-        value=code,
-        x=x,
-        y=y,
-        width=right - x,
-        height=bottom - y,
-    )
+def are_close_enough(parts: list[TextCell], max_gap: float = CODE_PART_GAP) -> bool:
+    if len(parts) <= 1:
+        return True
+    for i in range(len(parts) - 1):
+        gap = parts[i + 1].x - parts[i].right
+        if gap > max_gap:
+            return False
+    return True
 
 
-def split_merged_codes(merged_cell: TextCell, raw_cells: list[TextCell]) -> list[TextCell]:
-    codes = WINDOW_CODE_RE.findall(merged_cell.value)
-    if not codes:
-        return []
-    if len(codes) == 1:
-        return [estimate_code_box(merged_cell, raw_cells, codes[0])]
+def build_code_candidates_from_raw_rows(cells: list[TextCell]) -> list[TextCell]:
+    code_candidates = []
+    rows = cluster_rows(cells)
 
-    row_parts = []
-    for raw in raw_cells:
-        if abs(raw.y - merged_cell.y) > 2.5:
-            continue
-        if raw.x < merged_cell.x - 1 or raw.right > merged_cell.right + 1:
-            continue
-        row_parts.append(raw)
+    for row in rows:
+        idx = 0
+        while idx < len(row):
+            best_parts = None
+            best_code = None
 
-    row_parts.sort(key=lambda c: c.x)
-    results = []
-    start_idx = 0
-
-    for code in codes:
-        matched_parts = []
-        assembled = ""
-        idx = start_idx
-
-        while idx < len(row_parts):
-            part = row_parts[idx]
-            candidate = assembled + part.value
-            if code.startswith(candidate):
-                matched_parts.append(part)
-                assembled = candidate
-                idx += 1
-                if assembled == code:
+            for span in range(1, min(MAX_CODE_PARTS, len(row) - idx) + 1):
+                parts = row[idx: idx + span]
+                if not are_close_enough(parts):
                     break
+
+                combined = "".join(part.value for part in parts)
+                if WINDOW_CODE_FULL_RE.fullmatch(combined):
+                    best_parts = parts
+                    best_code = combined
+
+            if best_parts is not None:
+                code_candidates.append(merge_cells(best_parts, best_code))
+                idx += len(best_parts)
             else:
-                if not matched_parts:
-                    idx += 1
-                    start_idx = idx
-                    continue
-                break
+                idx += 1
 
-        if matched_parts and assembled == code:
-            x = min(p.x for p in matched_parts)
-            y = min(p.y for p in matched_parts)
-            right = max(p.right for p in matched_parts)
-            bottom = max(p.bottom for p in matched_parts)
-            results.append(
-                TextCell(
-                    cell_id=",".join(p.cell_id for p in matched_parts),
-                    value=code,
-                    x=x,
-                    y=y,
-                    width=right - x,
-                    height=bottom - y,
-                )
-            )
-            start_idx = idx
-        else:
-            results.append(estimate_code_box(merged_cell, raw_cells, code))
-
-    return results
+    return code_candidates
 
 
 def box_from_cell(cell: TextCell) -> tuple[float, float, float, float]:
@@ -280,18 +201,14 @@ def box_from_cell(cell: TextCell) -> tuple[float, float, float, float]:
 
 
 def build_symbols(cells: list[TextCell]) -> list[Symbol]:
-    merged_rows = [merge_row_segments(row) for row in cluster_rows(cells)]
-    merged_cells = list(itertools.chain.from_iterable(merged_rows))
-
-    code_candidates = []
-    for cell in merged_cells:
-        for code_cell in split_merged_codes(cell, cells):
-            if extract_prefix(code_cell.value):
-                code_candidates.append(code_cell)
+    code_candidates = [
+        cell for cell in build_code_candidates_from_raw_rows(cells)
+        if extract_prefix(cell.value)
+    ]
 
     class_candidates = [
         cell for cell in cells
-        if CLASS_RE.match(cell.value) and cell.value not in EXCLUDED_CLASSES
+        if CLASS_RE.fullmatch(cell.value) and cell.value not in EXCLUDED_CLASSES
     ]
 
     symbols = []
@@ -302,9 +219,10 @@ def build_symbols(cells: list[TextCell]) -> list[Symbol]:
         for class_cell in class_candidates:
             if class_cell.cell_id in used_classes:
                 continue
+
             vertical_gap = class_cell.y - code_cell.bottom
             center_gap = abs(class_cell.center_x - code_cell.center_x)
-            # 매칭 허용 범위 확대: 세로 간격을 25까지, 가로 편차를 코드 너비의 1.5배까지 허용
+
             if -4 <= vertical_gap <= 25 and center_gap <= max(20, code_cell.width * 1.5):
                 matches.append((abs(vertical_gap), center_gap, class_cell))
 
@@ -321,24 +239,16 @@ def build_symbols(cells: list[TextCell]) -> list[Symbol]:
         code_box = box_from_cell(code_cell)
         class_box = box_from_cell(class_cell)
 
-        min_x = min(code_box[0], class_box[0])
         min_y = min(code_box[1], class_box[1])
-        max_x = max(code_box[2], class_box[2])
         max_y = max(code_box[3], class_box[3])
 
-        # 사용자의 요청에 따라 AG(클래스 셀)의 수평 중심을 기준으로 박싱
         cx = class_cell.center_x
-        # 수직 중심은 전체 영역(부호+기호)의 중간을 유지하여 양쪽을 모두 커버
         cy = (min_y + max_y) / 2.0
 
-        # 고정 박스 크기
-        fixed_width = 24.0
-        fixed_height = 24.0
-
-        x = cx - fixed_width / 2.0
-        y = cy - fixed_height / 2.0
-        right = x + fixed_width
-        bottom = y + fixed_height
+        x = cx - FIXED_WIDTH / 2.0
+        y = cy - FIXED_HEIGHT / 2.0
+        right = x + FIXED_WIDTH
+        bottom = y + FIXED_HEIGHT
 
         symbols.append(
             Symbol(
@@ -373,16 +283,6 @@ def dedupe_symbols(symbols: list[Symbol]) -> list[Symbol]:
         if not duplicated:
             result.append(symbol)
     return result
-
-
-def overlaps(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    return ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1
-
-
-def resolve_symbol_overlaps(symbols: list[Symbol]) -> list[Symbol]:
-    return symbols
 
 
 def find_layer_id(root: ET.Element, layer_name: str) -> str:
@@ -422,10 +322,10 @@ def boxes_almost_same(a, b, tolerance: float = 3.0) -> bool:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     return (
-        abs(ax1 - bx1) <= tolerance and
-        abs(ay1 - by1) <= tolerance and
-        abs(ax2 - bx2) <= tolerance and
-        abs(ay2 - by2) <= tolerance
+        abs(ax1 - bx1) <= tolerance
+        and abs(ay1 - by1) <= tolerance
+        and abs(ax2 - bx2) <= tolerance
+        and abs(ay2 - by2) <= tolerance
     )
 
 
@@ -460,7 +360,6 @@ def apply_highlights(tree: ET.ElementTree):
     highlights = find_existing_highlights(root, tmpl_layer_id)
     manual_highlights, auto_highlights = split_manual_and_auto_highlights(highlights)
 
-    # 기존 자동 생성된 박스들을 삭제하여 업데이트가 반영되도록 함
     root_node = next(root.iter("root"))
     for obj, _, _ in auto_highlights:
         try:
@@ -475,7 +374,6 @@ def apply_highlights(tree: ET.ElementTree):
     else:
         style = DEFAULT_STYLE
 
-    # 수동으로 그린 박스 위치만 체크
     existing_boxes = []
     for _, _, geom in manual_highlights:
         x = float(geom.attrib.get("x", 0))
@@ -486,6 +384,7 @@ def apply_highlights(tree: ET.ElementTree):
 
     inserted = 0
     groups = {}
+
     for symbol in symbols:
         groups.setdefault(symbol.key, symbol)
         box = (symbol.x, symbol.y, symbol.right, symbol.bottom)

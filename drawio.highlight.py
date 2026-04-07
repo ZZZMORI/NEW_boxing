@@ -5,422 +5,200 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-
-WINDOW_CODE_FULL_RE = re.compile(
-    r"^(CM-B\d+[A-Za-z]?|CMB\d+[A-Za-z]?|[A-Z]{1,4}\d*(?:[-.][A-Z0-9]+)+[A-Za-z]?)$"
-)
-CLASS_RE = re.compile(r"^[A-Z]{2,3}$")
-EXCLUDED_CLASSES = {
-    "KEY", "MAP", "PIT", "EPS", "PS", "UP", "DN", "AD", "AV", "BY"
+# --- 설정 및 규칙 ---
+CODE_RULES = {
+    "PO": r"^PO\.\d+[A-Za-z]?$",
+    "CM-B": r"^CM-B\d+[A-Za-z]?$",
+    "CMB": r"^CMB\d+[A-Za-z]?$",
+    "CM": r"^CM-?\d+[A-Za-z]?$",
+    "OT": r"^OT-\d+[A-Za-z]?$",
+    "OF": r"^OF\d*-\d+[A-Za-z]?$",
+    "HO": r"^HO-\d+[A-Za-z]?$",
 }
 
-DEFAULT_STYLE = (
-    "rounded=1;fillColor=#fff2cc;arcSize=4;absoluteArcSize=1;"
-    "verticalAlign=middle;align=center;strokeColor=#d6b656;"
-    "strokeWidth=1.1811;opacity=50;noLabel=1"
-)
+INLINE_CODE_RULES = {
+    "AWPO": r"^AWPO\.\d+[A-Za-z]?$",
+    "ACWPO": r"^ACWPO\.\d+[A-Za-z]?$",
+    "FADW": r"^\d+FADW\.?\d+[A-Za-z]?$",
+    "FASD": r"^\d+FASD\.?\d+[A-Za-z]?$",
+    # 1F ADW.008, 1F RV.002 대응용 (normalize_text가 공백을 제거하므로 1FADW... 형태가 됨)
+    "F_ADW": r"^\d+FADW\.?\d+$",
+    "F_RV": r"^\d+FRV\.?\d+$",
+}
 
-ROW_TOLERANCE = 2.5
-CODE_PART_GAP = 4.5
-MAX_CODE_PARTS = 4
-FIXED_WIDTH = 24.0
-FIXED_HEIGHT = 24.0
+RANGE_CODE_RULES = {
+    "FADW_RANGE": r"^\d+FADW\.?\d+[A-Za-z]?\~\d+[A-Za-z]?$",
+    "FASD_RANGE": r"^\d+FASD\.?\d+[A-Za-z]?\~\d+[A-Za-z]?$",
+}
 
+COMPILED_CODE_RULES = {p: re.compile(r) for p, r in CODE_RULES.items()}
+COMPILED_INLINE_RULES = {k: re.compile(v) for k, v in INLINE_CODE_RULES.items()}
+COMPILED_RANGE_RULES = {k: re.compile(v) for k, v in RANGE_CODE_RULES.items()}
+
+# 사진 기반 유효 클래스 목록 확장
+VALID_CLASS_CODES = {"ACW", "AW", "AG", "CW", "FG", "SG", "SDW", "SD"}
+
+YELLOW_STYLE = "rounded=1;fillColor=#fff2cc;arcSize=4;absoluteArcSize=1;verticalAlign=middle;align=center;strokeColor=#d6b656;strokeWidth=1.1811;opacity=50;noLabel=1"
+GREEN_STYLE = "rounded=1;fillColor=#d5e8d4;arcSize=4;absoluteArcSize=1;verticalAlign=middle;align=center;strokeColor=#82b366;strokeWidth=1.1811;opacity=50;noLabel=1"
+
+# --- [중요] 원인 분석 결과에 따른 임계값 수정 ---
+ROW_TOLERANCE = 5.0           # 행 인식 높이 (더 넉넉하게)
+CODE_PART_GAP = 8.5           # 조각 간 간격 허용 (파편화 대응 강화)
+MAX_CODE_PARTS = 8            # 더 많은 조각 결합 허용
+
+FIXED_WIDTH, FIXED_HEIGHT = 24.0, 24.0
+INLINE_WIDTH, INLINE_HEIGHT = 36.0, 22.0  # 초록색 박스 살짝 확대
+
+CLASS_X_TOLERANCE = 15.0      # 상하 정렬 오차 허용 확대
+CLASS_MAX_VERTICAL_GAP = 28.0 # 위아래 간격 최대 허용치 확대
+CLASS_MIN_VERTICAL_GAP = -5.0 # 미세 중첩 허용
 
 @dataclass
 class TextCell:
-    cell_id: str
-    value: str
-    x: float
-    y: float
-    width: float
-    height: float
-
+    cell_id: str; value: str; x: float; y: float; width: float; height: float
     @property
-    def right(self) -> float:
-        return self.x + self.width
-
+    def right(self): return self.x + self.width
     @property
-    def bottom(self) -> float:
-        return self.y + self.height
-
+    def bottom(self): return self.y + self.height
     @property
-    def center_x(self) -> float:
-        return self.x + self.width / 2
-
+    def center_x(self): return self.x + self.width / 2
     @property
-    def center_y(self) -> float:
-        return self.y + self.height / 2
-
+    def center_y(self): return self.y + self.height / 2
 
 @dataclass
 class Symbol:
-    code: str
-    class_code: str
-    key: str
-    code_box: tuple[float, float, float, float]
-    class_box: tuple[float, float, float, float]
-    x: float
-    y: float
-    width: float
-    height: float
-
-    @property
-    def right(self) -> float:
-        return self.x + self.width
-
-    @property
-    def bottom(self) -> float:
-        return self.y + self.height
-
-    @property
-    def center_x(self) -> float:
-        return self.x + self.width / 2
-
-    @property
-    def center_y(self) -> float:
-        return self.y + self.height / 2
-
+    code: str; class_code: str | None; key: str; kind: str
+    x: float; y: float; width: float; height: float; source_cell_ids: list[str]
 
 def normalize_text(raw: str) -> str:
     text = html.unescape(raw or "")
-    text = text.replace("<br>", "").replace("<br/>", "").replace("<br />", "")
-    text = re.sub(r"<[^>]+>", "", text)
-    text = text.replace("&nbsp;", "")
-    text = re.sub(r"\s+", "", text)
-    return text.strip()
-
+    text = re.sub(r"<[^>]+>", "", text).replace("&nbsp;", "")
+    return re.sub(r"\s+", "", text).strip()
 
 def parse_text_cells(root: ET.Element, text_parent: str) -> list[TextCell]:
     cells = []
     for cell in root.iter("mxCell"):
-        if cell.attrib.get("parent") != text_parent:
-            continue
-        value = normalize_text(cell.attrib.get("value", ""))
-        if not value:
-            continue
+        if cell.attrib.get("parent") != text_parent: continue
+        val = normalize_text(cell.attrib.get("value", ""))
+        if not val: continue
         geom = cell.find("mxGeometry")
-        if geom is None:
-            continue
-        cells.append(
-            TextCell(
-                cell_id=cell.attrib.get("id", ""),
-                value=value,
-                x=float(geom.attrib.get("x", 0)),
-                y=float(geom.attrib.get("y", 0)),
-                width=float(geom.attrib.get("width", 0)),
-                height=float(geom.attrib.get("height", 0)),
-            )
-        )
+        if geom is None: continue
+        cells.append(TextCell(cell.attrib.get("id", ""), val, float(geom.attrib.get("x", 0)), float(geom.attrib.get("y", 0)), float(geom.attrib.get("width", 0)), float(geom.attrib.get("height", 0))))
     return cells
 
-
-def cluster_rows(cells: list[TextCell], tolerance: float = ROW_TOLERANCE) -> list[list[TextCell]]:
+def cluster_rows(cells: list[TextCell]) -> list[list[TextCell]]:
     rows = []
-    for cell in sorted(cells, key=lambda item: (item.y, item.x)):
+    for cell in sorted(cells, key=lambda c: (c.y, c.x)):
         for row in rows:
-            avg_y = sum(item.y for item in row) / len(row)
-            if abs(cell.y - avg_y) <= tolerance:
-                row.append(cell)
-                break
-        else:
-            rows.append([cell])
-    for row in rows:
-        row.sort(key=lambda item: item.x)
+            if abs(cell.y - (sum(c.y for c in row)/len(row))) <= ROW_TOLERANCE:
+                row.append(cell); break
+        else: rows.append([cell])
+    for r in rows: r.sort(key=lambda c: c.x)
     return rows
 
+def get_merged_candidates(row: list[TextCell], rules: dict):
+    candidates = []
+    idx = 0
+    while idx < len(row):
+        best = None
+        for span in range(1, min(MAX_CODE_PARTS, len(row) - idx) + 1):
+            parts = row[idx : idx + span]
+            gap_ok = True
+            for i in range(len(parts)-1):
+                if parts[i+1].x - parts[i].right > CODE_PART_GAP: gap_ok = False; break
+            if not gap_ok: continue
 
-def merge_cells(cells: list[TextCell], value: str | None = None) -> TextCell:
-    x = min(cell.x for cell in cells)
-    y = min(cell.y for cell in cells)
-    right = max(cell.right for cell in cells)
-    bottom = max(cell.bottom for cell in cells)
-    return TextCell(
-        cell_id=",".join(cell.cell_id for cell in cells),
-        value=value if value is not None else "".join(cell.value for cell in cells),
-        x=x,
-        y=y,
-        width=right - x,
-        height=bottom - y,
-    )
-
-
-def extract_prefix(code: str) -> str | None:
-    if code.startswith("CM-B"):
-        return "CM-B"
-    if code.startswith("CMB"):
-        return "CMB"
-    if "-" in code:
-        return code.split("-", 1)[0]
-    if "." in code:
-        return code.split(".", 1)[0]
-    return None
-
-
-def are_close_enough(parts: list[TextCell], max_gap: float = CODE_PART_GAP) -> bool:
-    if len(parts) <= 1:
-        return True
-    for i in range(len(parts) - 1):
-        gap = parts[i + 1].x - parts[i].right
-        if gap > max_gap:
-            return False
-    return True
-
-
-def build_code_candidates_from_raw_rows(cells: list[TextCell]) -> list[TextCell]:
-    code_candidates = []
-    rows = cluster_rows(cells)
-
-    for row in rows:
-        idx = 0
-        while idx < len(row):
-            best_parts = None
-            best_code = None
-
-            for span in range(1, min(MAX_CODE_PARTS, len(row) - idx) + 1):
-                parts = row[idx: idx + span]
-                if not are_close_enough(parts):
-                    break
-
-                combined = "".join(part.value for part in parts)
-                if WINDOW_CODE_FULL_RE.fullmatch(combined):
-                    best_parts = parts
-                    best_code = combined
-
-            if best_parts is not None:
-                code_candidates.append(merge_cells(best_parts, best_code))
-                idx += len(best_parts)
-            else:
-                idx += 1
-
-    return code_candidates
-
-
-def box_from_cell(cell: TextCell) -> tuple[float, float, float, float]:
-    return (cell.x, cell.y, cell.right, cell.bottom)
-
+            combined = "".join(p.value for p in parts)
+            prefix = next((k for k, v in rules.items() if v.fullmatch(combined)), None)
+            if prefix: best = (parts, combined, prefix)
+        
+        if best:
+            candidates.append(best)
+            idx += len(best[0])
+        else: idx += 1
+    return candidates
 
 def build_symbols(cells: list[TextCell]) -> list[Symbol]:
-    code_candidates = [
-        cell for cell in build_code_candidates_from_raw_rows(cells)
-        if extract_prefix(cell.value)
-    ]
+    all_rows = cluster_rows(cells)
+    green_symbols = []
+    green_cell_ids = set()
+    
+    for row in all_rows:
+        res = get_merged_candidates(row, {**COMPILED_INLINE_RULES, **COMPILED_RANGE_RULES})
+        for parts, val, pref in res:
+            kind = "range" if "~" in val else "inline"
+            min_x, max_r = min(p.x for p in parts), max(p.right for p in parts)
+            cy = sum(p.center_y for p in parts)/len(parts)
+            w = max(44.0, min(65.0, (max_r - min_x) + 10.0)) if kind == "range" else INLINE_WIDTH
+            green_symbols.append(Symbol(val, None, pref, kind, (min_x+max_r)/2 - w/2, cy - INLINE_HEIGHT/2, w, INLINE_HEIGHT, [p.cell_id for p in parts]))
+            for p in parts: green_cell_ids.add(p.cell_id)
 
-    class_candidates = [
-        cell for cell in cells
-        if CLASS_RE.fullmatch(cell.value) and cell.value not in EXCLUDED_CLASSES
-    ]
+    yellow_symbols = []
+    remaining_cells = [c for c in cells if c.cell_id not in green_cell_ids]
+    rem_rows = cluster_rows(remaining_cells)
+    
+    code_cands = []
+    for row in rem_rows:
+        res = get_merged_candidates(row, COMPILED_CODE_RULES)
+        for parts, val, pref in res:
+            min_x, min_y, max_r, max_b = min(p.x for p in parts), min(p.y for p in parts), max(p.right for p in parts), max(p.bottom for p in parts)
+            code_cands.append((TextCell(",".join(p.cell_id for p in parts), val, min_x, min_y, max_r-min_x, max_b-min_y), pref))
 
-    symbols = []
-    used_classes = set()
+    used_class_ids = set()
+    class_cells = [c for c in remaining_cells if c.value in VALID_CLASS_CODES]
 
-    for code_cell in sorted(code_candidates, key=lambda item: (item.y, item.x)):
+    for code, pref in code_cands:
         matches = []
-        for class_cell in class_candidates:
-            if class_cell.cell_id in used_classes:
-                continue
+        for cl in class_cells:
+            if cl.cell_id in used_class_ids: continue
+            v_gap = cl.y - code.bottom
+            c_gap = abs(cl.center_x - code.center_x)
+            if (CLASS_MIN_VERTICAL_GAP <= v_gap <= CLASS_MAX_VERTICAL_GAP) and (c_gap <= CLASS_X_TOLERANCE):
+                matches.append(cl)
+        
+        if matches:
+            target = min(matches, key=lambda m: abs(m.center_x - code.center_x))
+            used_class_ids.add(target.cell_id)
+            yellow_symbols.append(Symbol(code.value, target.value, f"{pref}|{target.value}", "stacked", (code.center_x + target.center_x)/2 - FIXED_WIDTH/2, (code.y + target.bottom)/2 - FIXED_HEIGHT/2, FIXED_WIDTH, FIXED_HEIGHT, code.cell_id.split(",") + [target.cell_id]))
 
-            vertical_gap = class_cell.y - code_cell.bottom
-            center_gap = abs(class_cell.center_x - code_cell.center_x)
-
-            if -4 <= vertical_gap <= 25 and center_gap <= max(20, code_cell.width * 1.5):
-                matches.append((abs(vertical_gap), center_gap, class_cell))
-
-        if not matches:
-            continue
-
-        _, _, class_cell = min(matches, key=lambda item: (item[0], item[1]))
-        used_classes.add(class_cell.cell_id)
-
-        prefix = extract_prefix(code_cell.value)
-        if not prefix:
-            continue
-
-        code_box = box_from_cell(code_cell)
-        class_box = box_from_cell(class_cell)
-
-        min_y = min(code_box[1], class_box[1])
-        max_y = max(code_box[3], class_box[3])
-
-        cx = class_cell.center_x
-        cy = (min_y + max_y) / 2.0
-
-        x = cx - FIXED_WIDTH / 2.0
-        y = cy - FIXED_HEIGHT / 2.0
-        right = x + FIXED_WIDTH
-        bottom = y + FIXED_HEIGHT
-
-        symbols.append(
-            Symbol(
-                code=code_cell.value,
-                class_code=class_cell.value,
-                key=f"{prefix}|{class_cell.value}",
-                code_box=code_box,
-                class_box=class_box,
-                x=x,
-                y=y,
-                width=right - x,
-                height=bottom - y,
-            )
-        )
-
-    return dedupe_symbols(symbols)
-
-
-def dedupe_symbols(symbols: list[Symbol]) -> list[Symbol]:
-    result = []
-    for symbol in symbols:
-        duplicated = False
-        for existing in result:
-            if (
-                symbol.code == existing.code
-                and symbol.class_code == existing.class_code
-                and abs(symbol.center_x - existing.center_x) < 4
-                and abs(symbol.center_y - existing.center_y) < 4
-            ):
-                duplicated = True
-                break
-        if not duplicated:
-            result.append(symbol)
-    return result
-
-
-def find_layer_id(root: ET.Element, layer_name: str) -> str:
-    for cell in root.iter("mxCell"):
-        if cell.attrib.get("value") == layer_name:
-            return cell.attrib["id"]
-    raise ValueError(f"{layer_name} not found.")
-
-
-def find_existing_highlights(root: ET.Element, layer_id: str):
-    highlights = []
-    for obj in root.iter("object"):
-        cell = obj.find("mxCell")
-        geom = cell.find("mxGeometry") if cell is not None else None
-        if cell is None or geom is None:
-            continue
-        if cell.attrib.get("parent") != layer_id:
-            continue
-        if "#fff2cc" in cell.attrib.get("style", ""):
-            highlights.append((obj, cell, geom))
-    return highlights
-
-
-def split_manual_and_auto_highlights(highlights):
-    manual = []
-    auto = []
-    for item in highlights:
-        obj, _, _ = item
-        if "AutoHighlight:" in obj.attrib.get("tags", ""):
-            auto.append(item)
-        else:
-            manual.append(item)
-    return manual, auto
-
-
-def boxes_almost_same(a, b, tolerance: float = 3.0) -> bool:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    return (
-        abs(ax1 - bx1) <= tolerance
-        and abs(ay1 - by1) <= tolerance
-        and abs(ax2 - bx2) <= tolerance
-        and abs(ay2 - by2) <= tolerance
-    )
-
-
-def make_highlight_object(layer_id: str, symbol: Symbol, style: str) -> ET.Element:
-    object_id = f"auto-hl-{uuid.uuid4().hex[:10]}"
-    obj = ET.Element("object", {"label": "", "tags": f"AutoHighlight:{symbol.key}", "id": object_id})
-    cell = ET.SubElement(obj, "mxCell", {"style": style, "vertex": "1", "parent": layer_id})
-    ET.SubElement(
-        cell,
-        "mxGeometry",
-        {
-            "x": f"{symbol.x:.3f}".rstrip("0").rstrip("."),
-            "y": f"{symbol.y:.3f}".rstrip("0").rstrip("."),
-            "width": f"{symbol.width:.3f}".rstrip("0").rstrip("."),
-            "height": f"{symbol.height:.3f}".rstrip("0").rstrip("."),
-            "as": "geometry",
-        },
-    )
-    return obj
-
+    return green_symbols + yellow_symbols
 
 def apply_highlights(tree: ET.ElementTree):
     root = tree.getroot()
     text_layer_id = find_layer_id(root, "Layer_Text")
     tmpl_layer_id = find_layer_id(root, "Layer_Tmpl")
-
     cells = parse_text_cells(root, text_layer_id)
-    symbols = build_symbols(cells)
-    if not symbols:
-        raise ValueError("No symbol pairs were detected.")
-
-    highlights = find_existing_highlights(root, tmpl_layer_id)
-    manual_highlights, auto_highlights = split_manual_and_auto_highlights(highlights)
-
+    
     root_node = next(root.iter("root"))
-    for obj, _, _ in auto_highlights:
-        try:
-            root_node.remove(obj)
-        except ValueError:
-            pass
+    for obj in [o for o in root.iter("object") if "AutoHighlight:" in o.attrib.get("tags", "")]:
+        try: root_node.remove(obj)
+        except: pass
 
-    if manual_highlights:
-        style = manual_highlights[0][1].attrib.get("style", DEFAULT_STYLE)
-    elif auto_highlights:
-        style = auto_highlights[0][1].attrib.get("style", DEFAULT_STYLE)
-    else:
-        style = DEFAULT_STYLE
+    all_symbols = build_symbols(cells)
+    for sym in all_symbols:
+        root_node.append(make_highlight_object(tmpl_layer_id, sym))
+    return len(all_symbols)
 
-    existing_boxes = []
-    for _, _, geom in manual_highlights:
-        x = float(geom.attrib.get("x", 0))
-        y = float(geom.attrib.get("y", 0))
-        w = float(geom.attrib.get("width", 0))
-        h = float(geom.attrib.get("height", 0))
-        existing_boxes.append((x, y, x + w, y + h))
+def find_layer_id(root, name):
+    for c in root.iter("mxCell"):
+        if c.attrib.get("value") == name: return c.attrib["id"]
+    raise ValueError(f"{name} not found")
 
-    inserted = 0
-    groups = {}
-
-    for symbol in symbols:
-        groups.setdefault(symbol.key, symbol)
-        box = (symbol.x, symbol.y, symbol.right, symbol.bottom)
-        if any(boxes_almost_same(box, existing) for existing in existing_boxes):
-            continue
-        root_node.append(make_highlight_object(tmpl_layer_id, symbol, style))
-        existing_boxes.append(box)
-        inserted += 1
-
-    return inserted, symbols, groups
-
+def make_highlight_object(layer_id, sym):
+    obj = ET.Element("object", {"label": "", "tags": f"AutoHighlight:{sym.key}", "id": f"auto-hl-{uuid.uuid4().hex[:10]}"})
+    style = GREEN_STYLE if sym.kind != 'stacked' else YELLOW_STYLE
+    cell = ET.SubElement(obj, "mxCell", {"style": style, "vertex": "1", "parent": layer_id})
+    ET.SubElement(cell, "mxGeometry", {"x": f"{sym.x:.2f}", "y": f"{sym.y:.2f}", "width": f"{sym.width:.2f}", "height": f"{sym.height:.2f}", "as": "geometry"})
+    return obj
 
 def main():
-    sources = [f for f in Path.cwd().glob("*.drawio") if not f.name.endswith("_auto-highlight.drawio")]
-    if not sources:
-        print("No source .drawio files found in the current directory.")
-        return
-
-    for source in sources:
-        output = Path.cwd() / f"{source.stem}_auto-highlight{source.suffix}"
+    for source in [f for f in Path.cwd().glob("*.drawio") if not f.name.endswith("_auto-highlight.drawio")]:
         try:
             tree = ET.parse(source)
-            inserted, symbols, groups = apply_highlights(tree)
-            tree.write(output, encoding="utf-8", xml_declaration=False)
-
-            print(f"\n--- Processing: {source.name} ---")
-            print(f"Detected symbols: {len(symbols)}")
-            print("Detected groups:")
-            for key, symbol in groups.items():
-                print(f"  {key} <- {symbol.code}/{symbol.class_code}")
-            print(f"Inserted highlights: {inserted}")
-            print(f"Wrote: {output}")
-        except Exception as e:
-            print(f"\n--- Skipping {source.name} ---")
-            print(f"Reason: {e}")
-
+            count = apply_highlights(tree)
+            tree.write(Path.cwd() / f"{source.stem}_auto-highlight{source.suffix}", encoding="utf-8", xml_declaration=False)
+            print(f"Processed {source.name}: {count} highlights added.")
+        except Exception as e: print(f"Error {source.name}: {e}")
 
 if __name__ == "__main__":
     main()
